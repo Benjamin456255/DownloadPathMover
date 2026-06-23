@@ -108,7 +108,7 @@
 ### 从源码编译
 
 ```powershell
-git clone https://github.com/Loe-918/DownloadPathMover.git
+git clone https://github.com/Benjamin456255/DownloadPathMover.git
 cd DownloadPathMover/csharp-version/DownloadMoverWpf
 dotnet publish -c Release -o ../../publish
 # 输出: ../../publish/DownloadPathMover.exe
