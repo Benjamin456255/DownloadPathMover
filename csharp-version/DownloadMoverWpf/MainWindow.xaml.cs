@@ -13,6 +13,91 @@ using Microsoft.Win32;
 
 namespace DownloadMoverWpf;
 
+public static class FolderPicker
+{
+    [DllImport("shell32.dll")]
+    private static extern int SHGetKnownFolderIDList(
+        [MarshalAs(UnmanagedType.LPStruct)] Guid rfid, uint dwFlags,
+        IntPtr hToken, out IntPtr ppidl);
+
+    public static string? Show()
+    {
+        var dlg = new FileOpenDialog() as IFileOpenDialog;
+        if (dlg == null) return null;
+        dlg.SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
+        // 默认打开"此电脑"
+        try
+        {
+            SHGetKnownFolderIDList(KnownFolders.ComputerFolder, 0, IntPtr.Zero, out var pidl);
+            dlg.SetDefaultFolder(pidl);
+            Marshal.FreeCoTaskMem(pidl);
+        }
+        catch { }
+
+        if (dlg.Show(IntPtr.Zero) == 0)
+        {
+            dlg.GetResult(out var item);
+            item.GetDisplayName(SIGDN_FILESYSPATH, out var path);
+            return path;
+        }
+        return null;
+    }
+
+    private const int FOS_PICKFOLDERS = 0x20;
+    private const int FOS_FORCEFILESYSTEM = 0x40;
+    private const int SIGDN_FILESYSPATH = unchecked((int)0x80058000);
+
+    [ComImport, Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")]
+    private class FileOpenDialog { }
+
+    [ComImport, Guid("42F85136-DB7E-439C-85F1-E4075D135FC8"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileOpenDialog
+    {
+        [PreserveSig] int Show(IntPtr parent);
+        void SetFileTypes(uint cFileTypes, IntPtr rgFilterSpec);
+        void SetFileTypeIndex(uint iFileType);
+        void GetFileTypeIndex(out uint piFileType);
+        void Advise(IntPtr pfde, out uint pdwCookie);
+        void Unadvise(uint dwCookie);
+        void SetOptions(uint fos);
+        void GetOptions(out uint pfos);
+        void SetDefaultFolder(IntPtr pidl);
+        void SetFolder(IntPtr pidl);
+        void GetFolder(out IntPtr ppidl);
+        void GetCurrentSelection(out IntPtr ppszName);
+        void SetFileName([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetFileName([MarshalAs(UnmanagedType.LPWStr)] out string pszName);
+        void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+        void SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string pszText);
+        void SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string pszLabel);
+        void GetResult(out IShellItem ppsi);
+        void AddPlace(IShellItem psi, int fdap);
+        void SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string pszDefaultExtension);
+        void Close(int hr);
+        void SetClientGuid([MarshalAs(UnmanagedType.LPStruct)] Guid guid);
+        void ClearClientData();
+        void SetFilter(IntPtr pFilter);
+    }
+
+    [ComImport, Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IShellItem
+    {
+        void BindToHandler(IntPtr pbc, [MarshalAs(UnmanagedType.LPStruct)] Guid bhid,
+            [MarshalAs(UnmanagedType.LPStruct)] Guid riid, out IntPtr ppv);
+        void GetParent(out IShellItem ppsi);
+        void GetDisplayName(int sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
+        void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+        void Compare(IShellItem psi, uint hint, out int piOrder);
+    }
+
+    private static class KnownFolders
+    {
+        public static readonly Guid ComputerFolder = new("20D04FE0-3AEA-1069-A2D8-08002B30309D");
+    }
+}
+
 public partial class MainWindow : Window
 {
     // ========================================================================
@@ -93,11 +178,51 @@ public partial class MainWindow : Window
         foreach (var (folder, tb) in CurPathTexts)
         {
             if (current.TryGetValue(folder, out var path) && path != null)
-                tb.Text = $"当前: {TruncatePath(path)}";
+            {
+                var sizeStr = "";
+                if (Directory.Exists(path))
+                {
+                    try
+                    {
+                        var size = GetFolderSize(path);
+                        sizeStr = size > 0 ? $"  ({FormatSize(size)})" : "";
+                    }
+                    catch { }
+                }
+                tb.Text = $"当前: {TruncatePath(path)}{sizeStr}";
+            }
             else
                 tb.Text = "当前: (未设置)";
         }
     }
+
+    /// <summary>递归计算文件夹大小（不含子目录深度以避免阻塞 UI）</summary>
+    private static long GetFolderSize(string path)
+    {
+        long total = 0;
+        try
+        {
+            // 仅统计直接子文件 + 一级子文件夹的大小（代表性，不递归过深）
+            foreach (var f in Directory.EnumerateFiles(path, "*", SearchOption.TopDirectoryOnly))
+            {
+                try { total += new FileInfo(f).Length; } catch { }
+            }
+            foreach (var d in Directory.EnumerateDirectories(path, "*", SearchOption.TopDirectoryOnly))
+            {
+                try { total += new DirectoryInfo(d).EnumerateFiles("*", SearchOption.AllDirectories).Sum(f => { try { return f.Length; } catch { return 0L; } }); } catch { }
+            }
+        }
+        catch { }
+        return total;
+    }
+
+    private static string FormatSize(long bytes) => bytes switch
+    {
+        >= 1_073_741_824 => $"{bytes / 1_073_741_824.0:F1} GB",
+        >= 1_048_576 => $"{bytes / 1_048_576.0:F1} MB",
+        >= 1_024 => $"{bytes / 1_024.0:F0} KB",
+        _ => $"{bytes} B",
+    };
 
     private Dictionary<string, string?> GetCurrentPathsFromRegistry()
     {
@@ -146,8 +271,18 @@ public partial class MainWindow : Window
     private void TxtDriveRoot_TextChanged(object sender, TextChangedEventArgs e) => SyncFolderPaths();
     private void BtnBrowseDrive_Click(object sender, RoutedEventArgs e)
     {
-        TxtDriveRoot.Focus();
-        TxtDriveRoot.SelectAll();
+        var folder = FolderPicker.Show();
+        if (folder != null)
+        {
+            // 提取盘符根路径
+            try
+            {
+                var root = Path.GetPathRoot(folder);
+                if (!string.IsNullOrEmpty(root))
+                    TxtDriveRoot.Text = root;
+            }
+            catch { TxtDriveRoot.Text = folder; }
+        }
     }
 
     // ========================================================================
@@ -206,9 +341,12 @@ public partial class MainWindow : Window
         catch { }
         try
         {
-            var kill = Process.Start(new ProcessStartInfo("taskkill",
-                $"/f /fi \"USERNAME eq {Environment.UserName}\" /im explorer.exe")
-            { UseShellExecute = false, CreateNoWindow = true });
+            var kill = Process.Start(new ProcessStartInfo("taskkill")
+            {
+                ArgumentList = { "/f", "/fi", $"USERNAME eq {Environment.UserName}", "/im", "explorer.exe" },
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            });
             kill?.WaitForExit(3000);
             Process.Start(new ProcessStartInfo("explorer.exe") { UseShellExecute = true });
         }
@@ -219,7 +357,7 @@ public partial class MainWindow : Window
     // 文件迁移
     // ========================================================================
     private static (int, int) MigrateFolder(string oldPath, string newPath,
-        IProgress<(int, int)>? progress = null)
+        IProgress<(int current, int total, string fileName)>? progress = null)
     {
         int succeeded = 0, failed = 0;
         if (!Directory.Exists(oldPath)) return (0, 0);
@@ -231,30 +369,38 @@ public partial class MainWindow : Window
         {
             var item = items[i];
             string dst = Path.Combine(newPath, item.Name);
-            progress?.Report((i + 1, total));
+            progress?.Report((i + 1, total, item.Name));
             try
             {
                 if (item is DirectoryInfo)
-                { if (!Directory.Exists(dst)) CopyDirectory(item.FullName, dst); }
-                else { if (!File.Exists(dst)) File.Copy(item.FullName, dst, overwrite: false); }
-                succeeded++;
+                { if (!Directory.Exists(dst)) succeeded -= CopyDirectory(item.FullName, dst); else succeeded++; }
+                else { if (!File.Exists(dst)) { try { File.Copy(item.FullName, dst, overwrite: false); succeeded++; } catch { failed++; } } else succeeded++; }
             }
             catch { failed++; }
         }
         return (succeeded, failed);
     }
 
-    private static void CopyDirectory(string src, string dst)
+    /// <returns>子目录中复制失败的文件数</returns>
+    private static int CopyDirectory(string src, string dst)
     {
+        int failed = 0;
         Directory.CreateDirectory(dst);
         string[] files;
         try { files = Directory.GetFiles(src); } catch { files = []; }
         foreach (var f in files)
-        { try { File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), overwrite: false); } catch { } }
+        {
+            try { File.Copy(f, Path.Combine(dst, Path.GetFileName(f)), overwrite: false); }
+            catch { failed++; }
+        }
         string[] dirs;
         try { dirs = Directory.GetDirectories(src); } catch { dirs = []; }
         foreach (var d in dirs)
-        { try { CopyDirectory(d, Path.Combine(dst, Path.GetFileName(d))); } catch { } }
+        {
+            try { failed += CopyDirectory(d, Path.Combine(dst, Path.GetFileName(d))); }
+            catch { failed++; }
+        }
+        return failed;
     }
 
     // ========================================================================
@@ -311,6 +457,23 @@ public partial class MainWindow : Window
         }
         if (ChkMigrate.IsChecked == true)
             sb.AppendLine("\n📦 同时迁移已有文件（复制不删除）");
+
+        // 检查目标盘符剩余空间
+        try
+        {
+            var driveInfo = new DriveInfo(drive[0].ToString());
+            if (driveInfo.IsReady)
+            {
+                sb.AppendLine($"\n💾 目标盘符 {drive[0]}:  可用空间 {FormatSize(driveInfo.AvailableFreeSpace)}");
+                if (driveInfo.AvailableFreeSpace < 1_073_741_824) // < 1GB
+                    sb.AppendLine("⚠️  可用空间不足 1 GB，请确认！");
+            }
+        }
+        catch { }
+
+        sb.AppendLine("\n⚠️  请确认已备份重要数据！文件以复制方式迁移，原文件不会删除。");
+        sb.AppendLine("   注册表修改可通过「撤销上次」按钮恢复。");
+        sb.AppendLine("   执行过程中会重启 Windows Explorer（文件资源管理器短暂闪烁）。");
         sb.AppendLine("\n确认执行？");
 
         if (MessageBox.Show(sb.ToString(), "操作确认", MessageBoxButton.OKCancel, MessageBoxImage.Question) != MessageBoxResult.OK)
@@ -367,7 +530,13 @@ public partial class MainWindow : Window
                                        Path.GetFullPath(newPath).TrimEnd('\\'),
                                        StringComparison.OrdinalIgnoreCase))
                     {
-                        var (s, f) = MigrateFolder(oldPath, newPath);
+                        var progress = new Progress<(int current, int total, string fileName)>(p =>
+                        {
+                            if (p.total == 0) return;
+                            Report($"📦 迁移 {folder}: {p.fileName}  ({p.current}/{p.total})",
+                                   60 + (int)((p.current / (double)p.total) * 15));
+                        });
+                        var (s, f) = MigrateFolder(oldPath, newPath, progress);
                         Log($"  迁移: 成功 {s}, 失败 {f}", f > 0 ? "warn" : "success");
                     }
                 }
